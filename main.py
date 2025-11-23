@@ -39,15 +39,26 @@ app.add_middleware(
 # --- 5. MongoDB Connection Events ---
 @app.on_event("startup")
 async def startup_db_client():
-    app.mongodb_client = AsyncIOMotorClient(MONGODB_URL)
-    app.mongodb = app.mongodb_client[DATABASE_NAME]
-    # Optional: add index for prediction_id
-    await app.mongodb["predictions"].create_index("prediction_id", unique=True)
-    print("✅ Connected to MongoDB!")
+    try:
+        app.mongodb_client = AsyncIOMotorClient(MONGODB_URL)
+        app.mongodb = app.mongodb_client[DATABASE_NAME]
+        
+        # Test the connection
+        await app.mongodb_client.admin.command('ping')
+        
+        # Optional: add index for prediction_id
+        await app.mongodb["predictions"].create_index("prediction_id", unique=True)
+        print("✅ Connected to MongoDB successfully!")
+        
+    except Exception as e:
+        print(f"❌ Failed to connect to MongoDB: {e}")
+        # Don't raise the exception to allow the app to start without MongoDB
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    app.mongodb_client.close()
+    if hasattr(app, 'mongodb_client'):
+        app.mongodb_client.close()
+        print("✅ Disconnected from MongoDB successfully!")
     print("❌ Disconnected from MongoDB.")
 
 # --- 6. Custom Exception Handler ---
@@ -75,6 +86,30 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.get("/")
 def root():
     return {"message": "Learning Style Detection API is running!", "status": "healthy"}
+
+# --- 7.1. Health check endpoint ---
+@app.get("/health")
+async def health_check():
+    mongodb_status = "disconnected"
+    mongodb_details = None
+    
+    try:
+        if hasattr(app, 'mongodb_client') and app.mongodb_client is not None:
+            # Test MongoDB connection
+            await app.mongodb_client.admin.command('ping')
+            mongodb_status = "connected"
+            mongodb_details = "MongoDB is accessible"
+        else:
+            mongodb_details = "MongoDB client not initialized"
+    except Exception as e:
+        mongodb_details = f"MongoDB error: {str(e)}"
+    
+    return {
+        "api_status": "healthy",
+        "mongodb_status": mongodb_status,
+        "mongodb_details": mongodb_details,
+        "timestamp": datetime.datetime.utcnow().isoformat()
+    }
 
 # --- 8. Pydantic Model ---
 class StudentData(BaseModel):
@@ -109,25 +144,54 @@ async def predict_learning_style(data: StudentData):
         input_df = input_df[expected_columns]
 
         processed_input = preprocessor.transform(input_df)
+        
+        # Get prediction probabilities (confidence percentages for each learning style)
+        prediction_proba = model.predict_proba(processed_input)
+        probabilities = prediction_proba[0]  # Get probabilities for the first (and only) sample
+        
+        # Get the predicted class (highest probability)
         prediction = model.predict(processed_input)
         prediction_value = int(prediction[0])
 
         # Generate a custom UUID for easier lookups
         prediction_uuid = str(uuid.uuid4())
 
-        result = await app.mongodb["predictions"].insert_one({
-            "prediction_id": prediction_uuid,
-            "learning_style": prediction_value,
-            "predicted_at": datetime.datetime.utcnow().isoformat(),
-            "user_data": input_dict
-        })
+        # Use a single timestamp for DB and response
+        predicted_at = datetime.datetime.utcnow().isoformat()
 
+        # Try to save to MongoDB, but don't fail if MongoDB is unavailable
+        try:
+            if hasattr(app, 'mongodb') and app.mongodb is not None:
+                result = await app.mongodb["predictions"].insert_one({
+                    "prediction_id": prediction_uuid,
+                    "learning_style": prediction_value,
+                    "predicted_at": predicted_at,
+                    "user_data": input_dict,
+                    "probabilities": probabilities.tolist()  # Save probabilities as well
+                })
+                print(f"✅ Prediction saved to MongoDB with ID: {str(result.inserted_id)}")
+            else:
+                print("⚠ MongoDB not available - prediction not saved to database")
+        except Exception as mongo_error:
+            print(f"⚠ MongoDB error (prediction still successful): {mongo_error}")
+
+        # Map numeric prediction to a readable name for frontend display
+        style_names = ['Visual', 'Auditory', 'Kinesthetic', 'Reading/Writing']
+        
+        # Build the prediction results with percentages for each learning style
+        prediction_results = []
+        for idx, style_name in enumerate(style_names):
+            prediction_results.append({
+                "style": style_name,
+                "percentage": round(float(probabilities[idx]) * 100, 2),
+                "is_predicted": idx == prediction_value
+            })
+
+        # Return only prediction information - NO database details
         return {
-            "learning_style_predicted": prediction_value,
-            "database_id": str(result.inserted_id),   # Mongo ObjectId
-            "prediction_id": prediction_uuid,         # UUID
-            "status": "success",
-            "input_received": input_dict
+            "predicted_style": style_names[prediction_value],
+            "predictions": prediction_results,
+            "status": "success"
         }
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=f"Validation error: {str(e)}")
@@ -138,6 +202,9 @@ async def predict_learning_style(data: StudentData):
 @app.get("/predictions")
 async def get_predictions(limit: int = 10):
     try:
+        if not hasattr(app, 'mongodb') or app.mongodb is None:
+            raise HTTPException(status_code=503, detail="MongoDB not available")
+            
         cursor = app.mongodb["predictions"].find().sort("predicted_at", -1).limit(limit)
         predictions = await cursor.to_list(length=limit)
 
@@ -149,6 +216,8 @@ async def get_predictions(limit: int = 10):
             "count": len(predictions),
             "status": "success"
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
